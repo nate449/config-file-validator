@@ -199,3 +199,96 @@ unknown2 = "bad"
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "schema validation failed")
 }
+
+func TestLoadTOMLWithInfProducesJSONMarshalError(t *testing.T) {
+	// Load: TOML with inf/nan values passes TOML syntax check but fails json.Marshal
+	// because JSON has no representation for infinity.
+	t.Parallel()
+	dir := t.TempDir()
+	writeConfig(t, dir, `[schema-map]
+"**/x" = "inf.json"
+
+[validators.csv]
+`)
+	// The above is valid schema-wise. We need actual infinity in a TOML value
+	// that gets marshaled. Use a standalone TOML file with a non-schema field.
+	// Actually, let's write raw TOML with inf as a top-level extra key.
+	// Since the schema won't allow arbitrary keys, json.Marshal error
+	// would occur before schema validation.
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, FileName),
+		[]byte("value = inf\n"),
+		0600,
+	))
+
+	_, err := Load(filepath.Join(dir, FileName))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "json")
+}
+
+func TestDiscoverReturnsEmptyForNonexistentDeepPath(t *testing.T) {
+	// Discover: verifies walk-up terminates at filesystem root when no .cfv.toml exists
+	t.Parallel()
+	dir := t.TempDir()
+	deep := filepath.Join(dir, "a", "b", "c", "d")
+	require.NoError(t, os.MkdirAll(deep, 0755))
+
+	path := Discover(deep)
+	require.Empty(t, path)
+}
+
+func TestLoadGitignoreOption(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writeConfig(t, dir, `gitignore = true`)
+
+	cfg, err := Load(filepath.Join(dir, FileName))
+	require.NoError(t, err)
+	require.True(t, *cfg.Gitignore)
+}
+
+func TestLoadCSVValidatorOptions(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[validators.csv]
+delimiter = ","
+comment = "#"
+lazy-quotes = true
+`)
+
+	cfg, err := Load(filepath.Join(dir, FileName))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.Validators.CSV)
+	require.Equal(t, ",", *cfg.Validators.CSV.Delimiter)
+	require.Equal(t, "#", *cfg.Validators.CSV.Comment)
+	require.True(t, *cfg.Validators.CSV.LazyQuotes)
+}
+
+func TestLoadJSONValidatorOptions(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[validators.json]
+forbid-duplicate-keys = true
+`)
+
+	cfg, err := Load(filepath.Join(dir, FileName))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.Validators.JSON)
+	require.True(t, *cfg.Validators.JSON.ForbidDuplicateKeys)
+}
+
+func TestLoadINIValidatorOptions(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writeConfig(t, dir, `
+[validators.ini]
+forbid-duplicate-keys = true
+`)
+
+	cfg, err := Load(filepath.Join(dir, FileName))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.Validators.INI)
+	require.True(t, *cfg.Validators.INI.ForbidDuplicateKeys)
+}

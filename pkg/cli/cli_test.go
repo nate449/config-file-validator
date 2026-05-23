@@ -1,9 +1,13 @@
 package cli
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/Boeing/config-file-validator/v2/internal/testhelper"
@@ -780,4 +784,209 @@ func Test_CLIStdinWithQuiet(t *testing.T) {
 	exitStatus, err := cli.Run()
 	require.NoError(t, err)
 	require.Equal(t, 0, exitStatus)
+}
+
+func Test_CLIStdinWithInvalidGroupOutput(t *testing.T) {
+	// runSingle error path: printReports fails when group-by value is invalid
+	cli := Init(
+		WithStdinData([]byte(`{"key": "value"}`), filetype.JSONFileType),
+		WithGroupOutput([]string{"invalid-group"}),
+	)
+	exitStatus, err := cli.Run()
+	require.Error(t, err)
+	require.Equal(t, 2, exitStatus)
+	require.ErrorContains(t, err, "unable to group by single value")
+}
+
+func Test_CLIJSONCFallbackNoteProduced(t *testing.T) {
+	// checkJSONCFallback: JSON file with trailing comma is valid JSONC but invalid JSON.
+	// The validator should produce a JSONC fallback note.
+	content := []byte("{\"key\": \"value\",}\n") // trailing comma = invalid JSON, valid JSONC
+	notes := checkJSONCFallback(
+		fmt.Errorf("invalid character '}' looking for beginning of object key string"),
+		filetype.JSONFileType,
+		content,
+		"config.json",
+	)
+	require.Len(t, notes, 1)
+	assert.Contains(t, notes[0], "valid JSONC")
+	assert.Contains(t, notes[0], "config.json")
+}
+
+func Test_CLIJSONCFallbackNilWhenBothFail(t *testing.T) {
+	// checkJSONCFallback: content that fails both JSON and JSONC returns nil
+	content := []byte("{bad") // invalid JSON AND invalid JSONC
+	notes := checkJSONCFallback(
+		fmt.Errorf("invalid character 'b' looking for beginning of object key string"),
+		filetype.JSONFileType,
+		content,
+		"broken.json",
+	)
+	require.Nil(t, notes)
+}
+
+func Test_CLIJSONCFallbackNilWhenNotJSON(t *testing.T) {
+	// checkJSONCFallback: non-JSON validator always returns nil
+	content := []byte("key: value\nbad:::\n")
+	notes := checkJSONCFallback(
+		fmt.Errorf("yaml parse error"),
+		filetype.YAMLFileType,
+		content,
+		"config.yaml",
+	)
+	require.Nil(t, notes)
+}
+
+func Test_CLIJSONCFallbackNilWhenNoSyntaxError(t *testing.T) {
+	// checkJSONCFallback: nil syntaxErr returns nil immediately
+	notes := checkJSONCFallback(nil, filetype.JSONFileType, []byte(`{}`), "ok.json")
+	require.Nil(t, notes)
+}
+
+func Test_CLISchemaMapWithNonJSONMarshalerValidator(t *testing.T) {
+	// validateWithExternal: INI does not implement JSONMarshaler or XMLSchemaValidator,
+	// so schema-map validation should pass (returns true, nil).
+	dir := t.TempDir()
+	testhelper.WriteFile(t, dir, "config.ini", "[section]\nkey=value\n")
+	testhelper.WriteFile(t, dir, "schema.json", `{"type": "object"}`)
+
+	fsFinder := finder.FileSystemFinderInit(
+		finder.WithPathRoots(dir + "/config.ini"),
+	)
+	cli := Init(
+		WithFinder(fsFinder),
+		WithSchemaMap(map[string]string{"config.ini": dir + "/schema.json"}),
+	)
+	exitStatus, err := cli.Run()
+	require.NoError(t, err)
+	require.Equal(t, 0, exitStatus)
+}
+
+func Test_CLISchemaMapWithUnfetchableSchemaURL(t *testing.T) {
+	// validateWithExternal: schema URL that returns HTTP 500 causes schema validation error
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	testhelper.WriteFile(t, dir, "config.json", `{"host": "db", "port": 5432}`)
+
+	fsFinder := finder.FileSystemFinderInit(
+		finder.WithPathRoots(dir + "/config.json"),
+	)
+	cli := Init(
+		WithFinder(fsFinder),
+		WithSchemaMap(map[string]string{"config.json": srv.URL + "/schema.json"}),
+	)
+	exitStatus, err := cli.Run()
+	require.NoError(t, err)
+	require.Equal(t, 1, exitStatus)
+}
+
+func Test_CLISchemaMapWithMalformedSchemaContent(t *testing.T) {
+	// validateWithExternal: schema URL that returns non-JSON content triggers error
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, "not valid json {{{")
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	testhelper.WriteFile(t, dir, "config.json", `{"host": "db"}`)
+
+	fsFinder := finder.FileSystemFinderInit(
+		finder.WithPathRoots(dir + "/config.json"),
+	)
+	cli := Init(
+		WithFinder(fsFinder),
+		WithSchemaMap(map[string]string{"config.json": srv.URL + "/schema.json"}),
+	)
+	exitStatus, err := cli.Run()
+	require.NoError(t, err)
+	require.Equal(t, 1, exitStatus)
+}
+
+func Test_GroupByFileTypeExtensionless(t *testing.T) {
+	// GroupByFileType: file without extension gets grouped as "unknown"
+	reports := []reporter.Report{
+		{FileName: "Makefile", FilePath: "/project/Makefile", IsValid: true},
+		{FileName: "config.json", FilePath: "/project/config.json", IsValid: true},
+	}
+	grouped := GroupByFileType(reports)
+	require.Contains(t, grouped, "unknown")
+	require.Contains(t, grouped, "json")
+	require.Len(t, grouped["unknown"], 1)
+	assert.Equal(t, "Makefile", grouped["unknown"][0].FileName)
+}
+
+func Test_formatErrorsSyntaxWithLineAndColumn(t *testing.T) {
+	t.Parallel()
+	err := &validator.ValidationError{
+		Err:    fmt.Errorf("unexpected token"),
+		Line:   5,
+		Column: 10,
+	}
+	errs, lines, cols := formatErrors(err, 5, 10)
+	require.Len(t, errs, 1)
+	assert.Contains(t, errs[0], "line 5, column 10")
+	assert.Contains(t, errs[0], "unexpected token")
+	assert.Equal(t, []int{5}, lines)
+	assert.Equal(t, []int{10}, cols)
+}
+
+func Test_formatErrorsSyntaxWithLineOnly(t *testing.T) {
+	t.Parallel()
+	err := &validator.ValidationError{
+		Err:  fmt.Errorf("missing value"),
+		Line: 3,
+	}
+	errs, lines, cols := formatErrors(err, 3, 0)
+	require.Len(t, errs, 1)
+	assert.Contains(t, errs[0], "line 3:")
+	assert.NotContains(t, errs[0], "column")
+	assert.Contains(t, errs[0], "missing value")
+	assert.Equal(t, []int{3}, lines)
+	assert.Equal(t, []int{0}, cols)
+}
+
+func Test_CLISchemaMapHTTPURLPassthrough(t *testing.T) {
+	// toSchemaURL: http:// URLs are passed through without modification
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"type": "object", "properties": {"host": {"type": "string"}}}`)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	testhelper.WriteFile(t, dir, "config.json", `{"host": "db"}`)
+
+	fsFinder := finder.FileSystemFinderInit(
+		finder.WithPathRoots(dir + "/config.json"),
+	)
+	cli := Init(
+		WithFinder(fsFinder),
+		WithSchemaMap(map[string]string{"config.json": srv.URL + "/schema.json"}),
+	)
+	exitStatus, err := cli.Run()
+	require.NoError(t, err)
+	require.Equal(t, 0, exitStatus)
+}
+
+func Test_CLISchemaMapMarshalToJSONError(t *testing.T) {
+	// validateWithExternal: MarshalToJSON fails when TOML contains inf (not representable in JSON)
+	dir := t.TempDir()
+	testhelper.WriteFile(t, dir, "config.toml", "value = inf\n")
+	schema := testhelper.WriteFile(t, dir, "schema.json", `{"type": "object"}`)
+
+	fsFinder := finder.FileSystemFinderInit(
+		finder.WithPathRoots(dir + "/config.toml"),
+	)
+	cli := Init(
+		WithFinder(fsFinder),
+		WithSchemaMap(map[string]string{"config.toml": schema}),
+	)
+	exitStatus, err := cli.Run()
+	require.NoError(t, err)
+	require.Equal(t, 1, exitStatus)
 }
